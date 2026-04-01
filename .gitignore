@@ -1,1 +1,4 @@
-/Assignment Homefirst.pdf
+env
+myenv/
+pycache/
+*.pyc
