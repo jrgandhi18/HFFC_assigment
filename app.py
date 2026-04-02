@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import re
+import uuid
 from io import BytesIO
 from typing import Any, Optional
 
@@ -41,10 +42,12 @@ SYSTEM_PROMPT = """
 You are HomeFirst Vernacular Loan Counselor.
 Rules:
 1) Always respond in the locked language: {locked_language}.
-2) Home-loan only. If user asks unrelated topics (personal loan, car loan, jokes, politics), politely redirect to home-loan counseling.
-3) Never do eligibility math directly. Use tools.
-4) Use FAQ context when user asks policy/document/process/eligibility questions.
-5) Be concise and practical.
+2) Use the proper script for the locked language: English for en-IN, Devanagari for hi-IN and mr-IN, Tamil script for ta-IN.
+3) Do not transliterate the answer into Latin letters when the locked language is Hindi, Marathi, or Tamil.
+4) Home-loan only. If user asks unrelated topics (personal loan, car loan, jokes, politics), politely redirect to home-loan counseling.
+5) Never do eligibility math directly. Use tools.
+6) Use FAQ context when user asks policy/document/process/eligibility questions.
+7) Be concise and practical.
 """.strip()
 
 INTENT_KEYWORDS = [
@@ -121,9 +124,11 @@ def detect_language(text: str) -> str:
     return "en-IN"
 
 
-def transcribe_audio(file_bytes: bytes, filename: str, language_code: str = "hi-IN") -> str:
+def transcribe_audio(file_bytes: bytes, filename: str, language_code: Optional[str] = None) -> str:
     files = {"file": (filename, file_bytes, "audio/wav")}
-    data = {"model": "saarika:v2.5", "language_code": language_code}
+    data = {"model": "saarika:v2.5"}
+    if language_code:
+        data["language_code"] = language_code
     headers = {"api-subscription-key": SARVAM_KEY}
     resp = requests.post(SARVAM_STT_URL, headers=headers, files=files, data=data, timeout=45)
     if resp.status_code != 200:
@@ -219,9 +224,13 @@ def _extract_first_json_block(raw: str) -> dict[str, Any]:
 
 def extract_entities(client: Groq, user_text: str) -> dict[str, Any]:
     prompt = (
-        "Extract entities from user input. Return strict JSON only with keys: "
-        "monthly_income, property_value, loan_amount_requested, employment_status, intent. "
-        "Use null when unknown. employment_status should be salaried/self-employed/unknown."
+        "Extract entities from user input and return strict JSON only with keys: "
+        "monthly_income, annual_income, property_value, loan_amount_requested, employment_status, tenure_years, interest_rate_percent, intent. "
+        "Normalize all money values into rupees as numbers. For example, '5 lakh' becomes 500000. "
+        "Normalize time values into integer years. If the user gives annual income, monthly_income may be inferred as annual_income/12. "
+        "If the user asks for EMI, keep loan_amount_requested and tenure_years whenever mentioned. "
+        "employment_status should be exactly salaried, self-employed, or unknown. "
+        "Use null when unknown."
     )
 
     resp = client.chat.completions.create(
@@ -238,12 +247,45 @@ def extract_entities(client: Groq, user_text: str) -> dict[str, Any]:
 
     normalized = {
         "monthly_income": data.get("monthly_income"),
+        "annual_income": data.get("annual_income"),
         "property_value": data.get("property_value"),
         "loan_amount_requested": data.get("loan_amount_requested"),
         "employment_status": data.get("employment_status") or "unknown",
+        "tenure_years": data.get("tenure_years"),
+        "interest_rate_percent": data.get("interest_rate_percent"),
         "intent": data.get("intent") or "unknown",
     }
+
     return normalized
+
+
+def detect_language_with_llm(client: Groq, user_text: str) -> Optional[str]:
+    prompt = (
+        "Classify the user's primary language for this conversation. "
+        "Choose exactly one code from: en-IN, hi-IN, mr-IN, ta-IN. "
+        "Decide from meaning and wording, not only script. "
+        "Return strict JSON only: {\"language_code\": \"...\"}."
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            temperature=0,
+            max_completion_tokens=80,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_text},
+            ],
+        )
+        content = resp.choices[0].message.content or "{}"
+        data = _extract_first_json_block(content)
+        code = (data.get("language_code") or "").strip()
+        if code in {"en-IN", "hi-IN", "mr-IN", "ta-IN"}:
+            return code
+    except Exception:
+        return None
+
+    return None
 
 
 def _is_out_of_domain(user_text: str) -> bool:
@@ -258,6 +300,94 @@ def _is_faq_query(user_text: str) -> bool:
     return any(x in text_l for x in faq_keys)
 
 
+def _dedupe_paragraphs(text: str) -> str:
+    parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if not parts:
+        return text.strip()
+
+    seen: set[str] = set()
+    keep: list[str] = []
+    for part in parts:
+        key = re.sub(r"\s+", " ", part.lower()).strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        keep.append(part)
+    return "\n\n".join(keep)
+
+
+def _has_non_english_script(text: str) -> bool:
+    for ch in text:
+        if ("\u0900" <= ch <= "\u097f") or ("\u0b80" <= ch <= "\u0bff"):
+            return True
+    return False
+
+
+def _has_latin_script(text: str) -> bool:
+    return any(("A" <= ch <= "Z") or ("a" <= ch <= "z") for ch in text)
+
+
+def _locked_language_style_instruction(locked_language: str) -> str:
+    if locked_language == "en-IN":
+        return "Write only in English. Do not use Devanagari or Tamil script."
+    if locked_language in {"hi-IN", "mr-IN"}:
+        return "Write only in Devanagari script. Do not transliterate into Latin letters."
+    if locked_language == "ta-IN":
+        return "Write only in Tamil script. Do not transliterate into Latin letters."
+    return "Write only in the locked language."
+
+
+def _rewrite_in_locked_language(client: Groq, text: str, locked_language: str) -> str:
+    rewrite_prompt = (
+        "Rewrite the assistant response in the exact locked language only. "
+        "Keep facts unchanged, remove repetition, keep it concise (max 120 words), "
+        "and stay only in home-loan counseling scope. "
+        + _locked_language_style_instruction(locked_language)
+    )
+    out = client.chat.completions.create(
+        model=LLM_MODEL,
+        temperature=0.1,
+        max_completion_tokens=220,
+        messages=[
+            {"role": "system", "content": f"Locked language: {locked_language}. {rewrite_prompt}"},
+            {"role": "user", "content": text},
+        ],
+    )
+    return (out.choices[0].message.content or "").strip() or text
+
+
+def finalize_reply(client: Groq, raw_reply: str, locked_language: str) -> str:
+    cleaned = _dedupe_paragraphs(raw_reply or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    # Force the proper script for the locked language.
+    if locked_language == "en-IN" and (_has_non_english_script(cleaned) or _has_latin_script(cleaned) is False):
+        cleaned = _rewrite_in_locked_language(client, cleaned, locked_language)
+    elif locked_language in {"hi-IN", "mr-IN"} and _has_latin_script(cleaned):
+        cleaned = _rewrite_in_locked_language(client, cleaned, locked_language)
+    elif locked_language == "ta-IN" and _has_latin_script(cleaned):
+        cleaned = _rewrite_in_locked_language(client, cleaned, locked_language)
+
+    # Keep UI and TTS stable; avoid long repetitive outputs.
+    if len(cleaned) > 700:
+        cleaned = cleaned[:697].rstrip() + "..."
+
+    return cleaned
+
+
+def _looks_uncertain_answer(text: str) -> bool:
+    t = (text or "").lower()
+    uncertain_markers = [
+        "i do not know",
+        "i don't know",
+        "not sure",
+        "cannot determine",
+        "can't determine",
+        "please provide more details",
+    ]
+    return any(m in t for m in uncertain_markers)
+
+
 def _is_high_intent(user_text: str, entities: dict[str, Any]) -> bool:
     text_l = user_text.lower()
     intent_signal = any(x in text_l for x in ["apply", "process", "start", "proceed", "next step", "loan chahiye", "apply now"])
@@ -265,6 +395,37 @@ def _is_high_intent(user_text: str, entities: dict[str, Any]) -> bool:
         entities.get(k) not in (None, "", 0) for k in ["monthly_income", "property_value", "loan_amount_requested"]
     ) and (entities.get("employment_status") or "unknown") != "unknown"
     return intent_signal and complete_financials
+
+
+def _maybe_log_conversation(
+    session_id: str,
+    user_text: str,
+    assistant_text: str,
+    locked_language: str,
+    entities: dict[str, Any],
+    tool_result: Optional[dict[str, Any]],
+    rag_mode: str,
+) -> str:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return "SUPABASE_NOT_CONFIGURED"
+
+    try:
+        from supabase import create_client
+
+        client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        row = {
+            "session_id": session_id,
+            "user_text": user_text,
+            "assistant_text": assistant_text,
+            "locked_language": locked_language,
+            "rag_mode": rag_mode,
+            "entities_json": entities,
+            "tool_result_json": tool_result,
+        }
+        client.table("conversation_logs").insert(row).execute()
+        return "SUPABASE_CONVERSATION_LOGGED"
+    except Exception as exc:
+        return f"SUPABASE_CONVERSATION_LOG_FAILED: {str(exc)[:140]}"
 
 
 def _maybe_log_handoff(entities: dict[str, Any], eligibility_payload: dict[str, Any]) -> str:
@@ -294,6 +455,7 @@ def _build_assistant_reply(
     faq_context: list[FAQDoc],
     tool_result: Optional[dict[str, Any]],
     out_of_domain: bool,
+    conversation_history: Optional[list[dict[str, str]]] = None,
 ) -> str:
     faq_block = "\n".join([f"Q: {d.question}\nA: {d.answer}" for d in faq_context])
     policy_msg = (
@@ -306,8 +468,14 @@ def _build_assistant_reply(
         {"role": "system", "content": SYSTEM_PROMPT.format(locked_language=locked_language)},
         {"role": "system", "content": policy_msg},
         {"role": "system", "content": "FAQ context:\n" + faq_block},
-        {"role": "user", "content": user_text},
     ]
+
+    if conversation_history:
+        for m in conversation_history[-6:]:
+            if m.get("role") in {"user", "assistant"} and m.get("content"):
+                messages.append({"role": m["role"], "content": m["content"]})
+
+    messages.append({"role": "user", "content": user_text})
 
     if tool_result:
         messages.append({"role": "system", "content": "Deterministic tool output (source of truth): " + json.dumps(tool_result)})
@@ -326,14 +494,22 @@ def maybe_run_tools(client: Groq, entities: dict[str, Any]) -> tuple[bool, Optio
         entities.get(k) not in (None, "", 0) for k in ["monthly_income", "property_value", "loan_amount_requested"]
     ) and entities.get("employment_status") not in (None, "", "unknown")
 
-    if not enough_for_eligibility:
+    enough_for_emi = entities.get("loan_amount_requested") not in (None, "", 0)
+
+    if not enough_for_eligibility and not enough_for_emi:
         return False, None
+
+    tenure_years = int(float(entities.get("tenure_years") or 20))
+
+    # Restrict available tools by available fields to avoid schema validation failures.
+    available_tools = [TOOL_SCHEMAS[1], TOOL_SCHEMAS[0]] if enough_for_eligibility else [TOOL_SCHEMAS[0]]
+    chosen_tool = "auto" if enough_for_eligibility else {"type": "function", "function": {"name": "calculate_emi"}}
 
     # Ask model to pick function call; fallback to deterministic direct call.
     tool_messages = [
         {
             "role": "system",
-            "content": "If all fields exist, call check_eligibility. If only principal present, call calculate_emi.",
+            "content": "If eligibility fields exist, call check_eligibility. Otherwise if loan amount exists, call calculate_emi.",
         },
         {
             "role": "user",
@@ -343,6 +519,7 @@ def maybe_run_tools(client: Groq, entities: dict[str, Any]) -> tuple[bool, Optio
                     "loan_amount": entities.get("loan_amount_requested"),
                     "property_value": entities.get("property_value"),
                     "employment_status": entities.get("employment_status"),
+                    "years": tenure_years,
                 }
             ),
         },
@@ -352,8 +529,8 @@ def maybe_run_tools(client: Groq, entities: dict[str, Any]) -> tuple[bool, Optio
         model=LLM_MODEL,
         temperature=0,
         max_completion_tokens=300,
-        tools=TOOL_SCHEMAS,
-        tool_choice="auto",
+        tools=available_tools,
+        tool_choice=chosen_tool,
         messages=tool_messages,
     )
 
@@ -366,9 +543,9 @@ def maybe_run_tools(client: Groq, entities: dict[str, Any]) -> tuple[bool, Optio
             emi = calculate_emi(
                 principal=float(args.get("principal", entities.get("loan_amount_requested") or 0)),
                 annual_rate=float(args.get("annual_rate", 9.2)),
-                years=int(args.get("years", 20)),
+                years=int(args.get("years", tenure_years)),
             )
-            return True, {"tool": "calculate_emi", "emi": emi}
+            return True, {"tool": "calculate_emi", "emi": emi, "years": int(args.get("years", tenure_years))}
         if name == "check_eligibility":
             result = check_eligibility(
                 monthly_income=float(args.get("monthly_income", entities.get("monthly_income") or 0)),
@@ -376,18 +553,26 @@ def maybe_run_tools(client: Groq, entities: dict[str, Any]) -> tuple[bool, Optio
                 property_value=float(args.get("property_value", entities.get("property_value") or 0)),
                 employment_status=str(args.get("employment_status", entities.get("employment_status") or "unknown")),
                 annual_rate=float(args.get("annual_rate", 9.2)),
-                years=int(args.get("years", 20)),
+                years=int(args.get("years", tenure_years)),
             )
             return True, {"tool": "check_eligibility", **result.to_dict()}
 
     # Deterministic fallback.
-    result = check_eligibility(
-        monthly_income=float(entities.get("monthly_income") or 0),
-        loan_amount=float(entities.get("loan_amount_requested") or 0),
-        property_value=float(entities.get("property_value") or 0),
-        employment_status=str(entities.get("employment_status") or "unknown"),
+    if enough_for_eligibility:
+        result = check_eligibility(
+            monthly_income=float(entities.get("monthly_income") or 0),
+            loan_amount=float(entities.get("loan_amount_requested") or 0),
+            property_value=float(entities.get("property_value") or 0),
+            employment_status=str(entities.get("employment_status") or "unknown"),
+            years=tenure_years,
+        )
+        return True, {"tool": "check_eligibility_fallback", **result.to_dict()}
+
+    emi = calculate_emi(
+        principal=float(entities.get("loan_amount_requested") or 0),
+        years=tenure_years,
     )
-    return True, {"tool": "check_eligibility_fallback", **result.to_dict()}
+    return True, {"tool": "calculate_emi_fallback", "emi": emi, "years": tenure_years}
 
 
 def _render_transcript(messages: list[dict[str, str]]) -> None:
@@ -412,6 +597,8 @@ def main() -> None:
         st.session_state.lc_runtime = build_langchain_faq_runtime(groq_api_key=GROQ_KEY, model_name=LLM_MODEL)
     if "last_debug" not in st.session_state:
         st.session_state.last_debug = {}
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = str(uuid.uuid4())
 
     col1, col2 = st.columns(2)
     with col1:
@@ -434,32 +621,60 @@ def main() -> None:
     if st.button("Process", disabled=source_bytes is None):
         try:
             lang_hint = st.session_state.locked_language or (None if forced_lang == "Auto-detect" else forced_lang)
-            transcript = transcribe_audio(source_bytes, filename, language_code=lang_hint or "hi-IN")
+            transcript = transcribe_audio(source_bytes, filename, language_code=lang_hint)
+
+            client = Groq(api_key=GROQ_KEY)
 
             if not st.session_state.locked_language:
-                st.session_state.locked_language = forced_lang if forced_lang != "Auto-detect" else detect_language(transcript)
+                if forced_lang != "Auto-detect":
+                    st.session_state.locked_language = forced_lang
+                else:
+                    llm_lang = detect_language_with_llm(client, transcript)
+                    st.session_state.locked_language = llm_lang or detect_language(transcript)
 
             locked_lang = st.session_state.locked_language
             st.success(f"Language locked: {locked_lang}")
             st.write("**Transcript:**", transcript)
 
-            client = Groq(api_key=GROQ_KEY)
             entities = extract_entities(client, transcript)
             faq_context = retrieve_faq_context(transcript, st.session_state.faq_docs, top_k=3)
             out_of_domain = _is_out_of_domain(transcript)
             tool_called, tool_result = maybe_run_tools(client, entities)
 
-            rag_mode = "langchain"
-            try:
-                reply = run_langchain_faq_agent(
-                    runtime=st.session_state.lc_runtime,
-                    user_query=transcript,
-                    locked_language=locked_lang,
-                    out_of_domain=out_of_domain,
-                    tool_result=tool_result,
-                )
-            except Exception:
-                rag_mode = "fallback"
+            if _is_faq_query(transcript):
+                rag_mode = "langchain"
+                try:
+                    reply = run_langchain_faq_agent(
+                        runtime=st.session_state.lc_runtime,
+                        user_query=transcript,
+                        locked_language=locked_lang,
+                        out_of_domain=out_of_domain,
+                        tool_result=tool_result,
+                    )
+                    if _looks_uncertain_answer(reply) and faq_context:
+                        rag_mode = "langchain_uncertain_fallback"
+                        reply = _build_assistant_reply(
+                            client=client,
+                            user_text=transcript,
+                            locked_language=locked_lang,
+                            faq_context=faq_context,
+                            tool_result=tool_result,
+                            out_of_domain=out_of_domain,
+                            conversation_history=st.session_state.messages,
+                        )
+                except Exception:
+                    rag_mode = "fallback"
+                    reply = _build_assistant_reply(
+                        client=client,
+                        user_text=transcript,
+                        locked_language=locked_lang,
+                        faq_context=faq_context,
+                        tool_result=tool_result,
+                        out_of_domain=out_of_domain,
+                        conversation_history=st.session_state.messages,
+                    )
+            else:
+                rag_mode = "direct"
                 reply = _build_assistant_reply(
                     client=client,
                     user_text=transcript,
@@ -467,7 +682,10 @@ def main() -> None:
                     faq_context=faq_context,
                     tool_result=tool_result,
                     out_of_domain=out_of_domain,
+                    conversation_history=st.session_state.messages,
                 )
+
+            reply = finalize_reply(client, reply, locked_lang)
 
             handoff_triggered = False
             handoff_status = "NOT_EVALUATED"
@@ -483,7 +701,18 @@ def main() -> None:
             st.session_state.messages.append({"role": "user", "content": transcript})
             st.session_state.messages.append({"role": "assistant", "content": reply})
 
+            conversation_log_status = _maybe_log_conversation(
+                session_id=st.session_state.session_id,
+                user_text=transcript,
+                assistant_text=reply,
+                locked_language=locked_lang,
+                entities=entities,
+                tool_result=tool_result,
+                rag_mode=rag_mode,
+            )
+
             st.session_state.last_debug = {
+                "session_id": st.session_state.session_id,
                 "locked_language": locked_lang,
                 "extracted_json": entities,
                 "tool_called": tool_called,
@@ -494,6 +723,7 @@ def main() -> None:
                 "langchain_init_error": getattr(st.session_state.lc_runtime, "init_error", None),
                 "handoff_triggered": handoff_triggered,
                 "handoff_log_status": handoff_status,
+                "conversation_log_status": conversation_log_status,
                 "tts_input_chars": len(tts_text),
                 "faq_corpus_size": len(st.session_state.faq_docs),
             }

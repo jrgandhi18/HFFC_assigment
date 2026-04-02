@@ -3,3 +3,10 @@ requests
 groq
 python-dotenv
 audio-recorder-streamlit
+beautifulsoup4
+supabase
+langchain
+langchain-community
+langchain-text-splitters
+langchain-groq
+faiss-cpu
